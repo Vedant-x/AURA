@@ -20,10 +20,13 @@ def chat(msg: Message):
     result = supabase.table("memories").select("*").order("created_at", desc=True).limit(10).execute()
     past = list(reversed(result.data))
 
-    messages = []
+   messages = []
     for entry in past:
-        messages.append({"role": "user", "content": entry["user_message"]})
-        messages.append({"role": "assistant", "content": entry["aura_reply"]})
+        user_msg = (entry.get("user_message") or "").strip()
+        aura_msg = (entry.get("aura_reply") or "").strip()
+        if user_msg and aura_msg:
+            messages.append({"role": "user", "content": user_msg})
+            messages.append({"role": "assistant", "content": aura_msg})
 
     messages.append({"role": "user", "content": msg.text})
 
