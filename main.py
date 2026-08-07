@@ -20,7 +20,7 @@ def chat(msg: Message):
     result = supabase.table("memories").select("*").order("created_at", desc=True).limit(10).execute()
     past = list(reversed(result.data))
 
-   messages = []
+    messages = []
     for entry in past:
         user_msg = (entry.get("user_message") or "").strip()
         aura_msg = (entry.get("aura_reply") or "").strip()
@@ -44,3 +44,65 @@ def chat(msg: Message):
     }).execute()
 
     return {"reply": reply_text}
+
+
+screen_state = {
+    "pending_question": None,
+    "result": None,
+}
+
+class ScreenRequest(BaseModel):
+    question: str
+
+@app.post("/screen-request")
+def screen_request(req: ScreenRequest):
+    screen_state["pending_question"] = req.question
+    screen_state["result"] = None
+    return {"status": "queued"}
+
+@app.get("/screen-pending")
+def screen_pending():
+    if screen_state["pending_question"]:
+        return {"question": screen_state["pending_question"]}
+    return {"question": None}
+
+class ScreenUpload(BaseModel):
+    image_base64: str
+    question: str
+
+@app.post("/screen-upload")
+def screen_upload(payload: ScreenUpload):
+    response = client.messages.create(
+        model="claude-sonnet-5",
+        max_tokens=1024,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": payload.image_base64,
+                        },
+                    },
+                    {"type": "text", "text": payload.question},
+                ],
+            }
+        ],
+    )
+    reply_text = next(block.text for block in response.content if block.type == "text")
+
+    screen_state["pending_question"] = None
+    screen_state["result"] = reply_text
+
+    return {"status": "done"}
+
+@app.get("/screen-result")
+def screen_result():
+    if screen_state["result"]:
+        result = screen_state["result"]
+        screen_state["result"] = None
+        return {"reply": result}
+    return {"reply": None}
