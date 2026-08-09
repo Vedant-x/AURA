@@ -1,4 +1,3 @@
-#v2
 from fastapi import FastAPI
 from pydantic import BaseModel
 from anthropic import Anthropic
@@ -95,7 +94,7 @@ def screen_upload(payload: ScreenUpload):
     )
     reply_text = next(block.text for block in response.content if block.type == "text")
 
-   screen_state["pending_question"] = None
+    screen_state["pending_question"] = None
     screen_state["result"] = reply_text
 
     supabase.table("screen_logs").insert({
