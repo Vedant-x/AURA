@@ -4,6 +4,7 @@ from anthropic import Anthropic
 from supabase import create_client
 from dotenv import load_dotenv
 import os
+import time
 
 load_dotenv()
 
@@ -111,3 +112,37 @@ def screen_result():
         screen_state["result"] = None
         return {"reply": result}
     return {"reply": None}
+
+
+class AskRequest(BaseModel):
+    text: str
+
+@app.post("/ask")
+def ask(req: AskRequest):
+    classify = client.messages.create(
+        model="claude-sonnet-5",
+        max_tokens=10,
+        messages=[{
+            "role": "user",
+            "content": f"Does answering this question require seeing the user's computer screen right now? Reply with only YES or NO, nothing else.\n\nQuestion: {req.text}"
+        }]
+    )
+    decision = next(block.text for block in classify.content if block.type == "text").strip().upper()
+
+    if "YES" in decision:
+        screen_state["pending_question"] = req.text
+        screen_state["result"] = None
+
+        waited = 0
+        while waited < 25:
+            time.sleep(1)
+            waited += 1
+            if screen_state["result"]:
+                result = screen_state["result"]
+                screen_state["result"] = None
+                return {"reply": result}
+
+        return {"reply": "I tried to check your screen but didn't get a response in time. Make sure the watcher is running."}
+
+    else:
+        return chat(Message(text=req.text))
