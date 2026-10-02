@@ -2,3 +2,9 @@ venv/
 .env
 __pycache__/
 *.pyc
+.venv/
+.watcher.lock
+watcher_log.txt
+watcher.log
+watcher-error.log
+memory.json

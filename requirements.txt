@@ -1,5 +1,5 @@
-fastapi
-uvicorn
-anthropic
-python-dotenv
-supabase
+fastapi==0.128.8
+uvicorn==0.39.0
+anthropic==0.125.0
+python-dotenv==1.2.1
+supabase==2.31.0

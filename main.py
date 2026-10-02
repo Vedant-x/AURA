@@ -2,7 +2,7 @@
 AURA backend — chat, persistent memory, and screen awareness.
 """
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from anthropic import Anthropic
 from supabase import create_client
@@ -10,6 +10,9 @@ from dotenv import load_dotenv
 import os
 import asyncio
 import logging
+import secrets
+import threading
+import time
 
 # ---------------------------------------------------------------------------
 # Setup
@@ -23,7 +26,16 @@ logger = logging.getLogger("aura")
 client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 
-app = FastAPI(title="AURA")
+def require_api_token(authorization: str = Header(default="")):
+    """Enable bearer authentication when AURA_API_TOKEN is configured."""
+    token = os.getenv("AURA_API_TOKEN")
+    if token:
+        scheme, _, value = authorization.partition(" ")
+        if scheme.lower() != "bearer" or not secrets.compare_digest(value, token):
+            raise HTTPException(status_code=401, detail="Invalid or missing API token")
+
+
+app = FastAPI(title="AURA", dependencies=[Depends(require_api_token)])
 
 # ---------------------------------------------------------------------------
 # Config — tune behavior here instead of hunting through the file
@@ -35,6 +47,7 @@ MEMORY_LOOKBACK = 10          # how many past exchanges to include as context
 LOG_SUMMARY_CHARS = 500       # how much of a screen reply to store in screen_logs
 SCREEN_WAIT_TIMEOUT = 25      # seconds to wait for a watcher to respond
 SCREEN_POLL_INTERVAL = 1      # seconds between checks while waiting
+SCREEN_REQUEST_TTL = 120      # clear abandoned direct screen requests
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -46,13 +59,16 @@ def extract_text(response, default="I couldn't generate a response that time —
 
 
 def call_claude(**kwargs) -> str:
-    """Wrap the Anthropic call so a transient failure doesn't 500 the whole endpoint."""
+    """Return a real answer or surface the upstream failure to the client."""
     try:
         response = client.messages.create(**kwargs)
-        return extract_text(response)
-    except Exception as e:
-        logger.error(f"Claude API call failed: {e}")
-        return "AURA hit an error talking to Claude — try again in a moment."
+    except Exception:
+        logger.exception("Claude API call failed")
+        raise HTTPException(status_code=502, detail="AI service unavailable")
+    reply = extract_text(response, default="")
+    if not reply:
+        raise HTTPException(status_code=502, detail="AI service returned no text")
+    return reply
 
 
 # ---------------------------------------------------------------------------
@@ -107,16 +123,35 @@ def chat(msg: Message):
 
 screen_state = {
     "pending_question": None,
+    "active_question": None,
+    "started_at": None,
     "result": None,
 }
+screen_lock = threading.Lock()
+
+def expire_screen_request():
+    """Caller must hold screen_lock."""
+    started_at = screen_state["started_at"]
+    if started_at is not None and time.monotonic() - started_at > SCREEN_REQUEST_TTL:
+        screen_state.update(
+            pending_question=None, active_question=None, started_at=None, result=None
+        )
 
 class ScreenRequest(BaseModel):
     question: str
 
 @app.post("/screen-request")
 def screen_request(req: ScreenRequest):
-    screen_state["pending_question"] = req.question
-    screen_state["result"] = None
+    if not req.question.strip():
+        raise HTTPException(status_code=422, detail="Question cannot be empty")
+    with screen_lock:
+        expire_screen_request()
+        if screen_state["active_question"] is not None:
+            raise HTTPException(status_code=409, detail="A screen request is already in progress")
+        screen_state["pending_question"] = req.question
+        screen_state["active_question"] = req.question
+        screen_state["started_at"] = time.monotonic()
+        screen_state["result"] = None
     logger.info(f"Screen request queued: {req.question!r}")
     return {"status": "queued"}
 
@@ -126,9 +161,11 @@ def screen_pending():
     """Atomic claim — first watcher to read this gets the question; it's
     cleared immediately so a second watcher polling moments later doesn't
     also pick it up."""
-    question = screen_state["pending_question"]
-    if question:
+    with screen_lock:
+        expire_screen_request()
+        question = screen_state["pending_question"]
         screen_state["pending_question"] = None
+    if question:
         logger.info(f"Screen request claimed: {question!r}")
         return {"question": question}
     return {"question": None}
@@ -140,6 +177,10 @@ class ScreenUpload(BaseModel):
 
 @app.post("/screen-upload")
 def screen_upload(payload: ScreenUpload):
+    with screen_lock:
+        expire_screen_request()
+        if payload.question != screen_state["active_question"] or screen_state["pending_question"]:
+            raise HTTPException(status_code=409, detail="Screen request is not active")
     reply_text = call_claude(
         model=CHAT_MODEL,
         max_tokens=1024,
@@ -159,12 +200,18 @@ def screen_upload(payload: ScreenUpload):
         }],
     )
 
-    screen_state["result"] = reply_text
+    with screen_lock:
+        if payload.question != screen_state["active_question"]:
+            raise HTTPException(status_code=410, detail="Screen request expired")
+        screen_state["result"] = reply_text
 
-    supabase.table("screen_logs").insert({
-        "question": payload.question,
-        "reply_summary": reply_text[:LOG_SUMMARY_CHARS],
-    }).execute()
+    try:
+        supabase.table("screen_logs").insert({
+            "question": payload.question,
+            "reply_summary": reply_text[:LOG_SUMMARY_CHARS],
+        }).execute()
+    except Exception:
+        logger.exception("Failed to save screen log")
 
     logger.info("Screen reply ready.")
     return {"status": "done"}
@@ -172,10 +219,14 @@ def screen_upload(payload: ScreenUpload):
 
 @app.get("/screen-result")
 def screen_result():
-    if screen_state["result"]:
-        result = screen_state["result"]
-        screen_state["result"] = None
-        return {"reply": result}
+    with screen_lock:
+        expire_screen_request()
+        if screen_state["result"]:
+            result = screen_state["result"]
+            screen_state["result"] = None
+            screen_state["active_question"] = None
+            screen_state["started_at"] = None
+            return {"reply": result}
     return {"reply": None}
 
 
@@ -214,20 +265,34 @@ async def ask(req: AskRequest):
     )
     decision = decision.strip().upper()
 
-    if "YES" not in decision:
+    if not decision.startswith("YES"):
         return await asyncio.to_thread(chat, Message(text=req.text))
 
-    screen_state["result"] = None
-    screen_state["pending_question"] = req.text
+    with screen_lock:
+        expire_screen_request()
+        if screen_state["active_question"] is not None:
+            raise HTTPException(status_code=409, detail="A screen request is already in progress")
+        screen_state["result"] = None
+        screen_state["pending_question"] = req.text
+        screen_state["active_question"] = req.text
+        screen_state["started_at"] = time.monotonic()
 
-    waited = 0
-    while waited < SCREEN_WAIT_TIMEOUT:
-        await asyncio.sleep(SCREEN_POLL_INTERVAL)
-        waited += SCREEN_POLL_INTERVAL
-        if screen_state["result"]:
-            result = screen_state["result"]
+    try:
+        waited = 0
+        while waited < SCREEN_WAIT_TIMEOUT:
+            await asyncio.sleep(SCREEN_POLL_INTERVAL)
+            waited += SCREEN_POLL_INTERVAL
+            with screen_lock:
+                if screen_state["result"]:
+                    result = screen_state["result"]
+                    screen_state["result"] = None
+                    return {"reply": result}
+    finally:
+        with screen_lock:
+            screen_state["pending_question"] = None
+            screen_state["active_question"] = None
+            screen_state["started_at"] = None
             screen_state["result"] = None
-            return {"reply": result}
 
     return {
         "reply": (
