@@ -2,6 +2,7 @@ import importlib
 import os
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
+from threading import Event
 import time
 import unittest
 from unittest.mock import Mock, patch
@@ -47,7 +48,8 @@ class BackendTests(unittest.TestCase):
         )
         with main.screen_lock:
             main.screen_state.update(
-                pending_question=None, active_question=None, started_at=None, result=None
+                pending_question=None, active_question=None, started_at=None,
+                uploading=False, result=None
             )
         self.http = TestClient(main.app)
 
@@ -81,6 +83,28 @@ class BackendTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 409)
         self.assertIsNone(main.screen_state["result"])
+
+    def test_duplicate_upload_is_rejected_while_first_is_processing(self):
+        self.http.post("/screen-request", json={"question": "my screen"})
+        self.http.get("/screen-pending")
+        started, release = Event(), Event()
+
+        def slow_answer(**_kwargs):
+            started.set()
+            release.wait(2)
+            return SimpleNamespace(
+                content=[SimpleNamespace(type="text", text="One answer")]
+            )
+
+        payload = {"question": "my screen", "image_base64": "AA=="}
+        with patch.object(main.client.messages, "create", side_effect=slow_answer):
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                first = pool.submit(self.http.post, "/screen-upload", json=payload)
+                self.assertTrue(started.wait(2))
+                duplicate = self.http.post("/screen-upload", json=payload)
+                self.assertEqual(duplicate.status_code, 409)
+                release.set()
+                self.assertEqual(first.result(timeout=3).status_code, 200)
 
     def test_screen_answer_survives_log_failure(self):
         self.logs.fail_insert = True

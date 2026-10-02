@@ -125,6 +125,7 @@ screen_state = {
     "pending_question": None,
     "active_question": None,
     "started_at": None,
+    "uploading": False,
     "result": None,
 }
 screen_lock = threading.Lock()
@@ -134,7 +135,8 @@ def expire_screen_request():
     started_at = screen_state["started_at"]
     if started_at is not None and time.monotonic() - started_at > SCREEN_REQUEST_TTL:
         screen_state.update(
-            pending_question=None, active_question=None, started_at=None, result=None
+            pending_question=None, active_question=None, started_at=None,
+            uploading=False, result=None
         )
 
 class ScreenRequest(BaseModel):
@@ -151,6 +153,7 @@ def screen_request(req: ScreenRequest):
         screen_state["pending_question"] = req.question
         screen_state["active_question"] = req.question
         screen_state["started_at"] = time.monotonic()
+        screen_state["uploading"] = False
         screen_state["result"] = None
     logger.info(f"Screen request queued: {req.question!r}")
     return {"status": "queued"}
@@ -179,31 +182,45 @@ class ScreenUpload(BaseModel):
 def screen_upload(payload: ScreenUpload):
     with screen_lock:
         expire_screen_request()
-        if payload.question != screen_state["active_question"] or screen_state["pending_question"]:
+        if (
+            payload.question != screen_state["active_question"]
+            or screen_state["pending_question"]
+            or screen_state["uploading"]
+            or screen_state["result"] is not None
+        ):
             raise HTTPException(status_code=409, detail="Screen request is not active")
-    reply_text = call_claude(
-        model=CHAT_MODEL,
-        max_tokens=1024,
-        messages=[{
-            "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "image/png",
-                        "data": payload.image_base64,
+        request_started_at = screen_state["started_at"]
+        screen_state["uploading"] = True
+    try:
+        reply_text = call_claude(
+            model=CHAT_MODEL,
+            max_tokens=1024,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": payload.image_base64,
+                        },
                     },
-                },
-                {"type": "text", "text": payload.question},
-            ],
-        }],
-    )
+                    {"type": "text", "text": payload.question},
+                ],
+            }],
+        )
+    except Exception:
+        with screen_lock:
+            if screen_state["started_at"] == request_started_at:
+                screen_state["uploading"] = False
+        raise
 
     with screen_lock:
-        if payload.question != screen_state["active_question"]:
+        if screen_state["started_at"] != request_started_at:
             raise HTTPException(status_code=410, detail="Screen request expired")
         screen_state["result"] = reply_text
+        screen_state["uploading"] = False
 
     try:
         supabase.table("screen_logs").insert({
@@ -226,6 +243,7 @@ def screen_result():
             screen_state["result"] = None
             screen_state["active_question"] = None
             screen_state["started_at"] = None
+            screen_state["uploading"] = False
             return {"reply": result}
     return {"reply": None}
 
@@ -275,7 +293,9 @@ async def ask(req: AskRequest):
         screen_state["result"] = None
         screen_state["pending_question"] = req.text
         screen_state["active_question"] = req.text
-        screen_state["started_at"] = time.monotonic()
+        request_started_at = time.monotonic()
+        screen_state["started_at"] = request_started_at
+        screen_state["uploading"] = False
 
     try:
         waited = 0
@@ -289,10 +309,12 @@ async def ask(req: AskRequest):
                     return {"reply": result}
     finally:
         with screen_lock:
-            screen_state["pending_question"] = None
-            screen_state["active_question"] = None
-            screen_state["started_at"] = None
-            screen_state["result"] = None
+            if screen_state["started_at"] == request_started_at:
+                screen_state["pending_question"] = None
+                screen_state["active_question"] = None
+                screen_state["started_at"] = None
+                screen_state["uploading"] = False
+                screen_state["result"] = None
 
     return {
         "reply": (
